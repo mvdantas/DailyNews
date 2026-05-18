@@ -1,41 +1,57 @@
 import os
+import re
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import date
-from firecrawl import FirecrawlApp
+import feedparser
 import anthropic
 
 # --- Configuração ---
-FIRECRAWL_API_KEY = os.environ["FIRECRAWL_API_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-GMAIL_SENDER     = os.environ["GMAIL_SENDER_EMAIL"]
-GMAIL_PASSWORD   = os.environ["GMAIL_APP_PASSWORD"]
-RECIPIENT_EMAIL  = GMAIL_SENDER  # envia para si mesmo; troque se quiser outro destinatário
+GMAIL_SENDER      = os.environ["GMAIL_SENDER_EMAIL"]
+GMAIL_PASSWORD    = os.environ["GMAIL_APP_PASSWORD"]
+RECIPIENT_EMAIL   = GMAIL_SENDER  # envia para si mesmo; troque se quiser outro destinatário
 
 TEMAS = ["tecnologia e inteligência artificial", "negócios e mercado financeiro", "política e atualidades"]
 
+# RSS públicos dos jornais solicitados
 FONTES = [
-    "https://news.google.com/rss/search?q=tecnologia+IA&hl=pt-BR&gl=BR&ceid=BR:pt-419",
-    "https://news.google.com/rss/search?q=mercado+financeiro+economia&hl=pt-BR&gl=BR&ceid=BR:pt-419",
-    "https://news.google.com/rss/search?q=politica+brasil+atualidades&hl=pt-BR&gl=BR&ceid=BR:pt-419",
-    "https://techcrunch.com/feed/",
-    "https://feeds.feedburner.com/venturebeat/SZYF",
+    ("New York Times",       "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"),
+    ("New York Times Tech",  "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml"),
+    ("Wall Street Journal",  "https://feeds.a.dj.com/rss/RSSWorldNews.xml"),
+    ("Wall Street Journal",  "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
+    ("Financial Times",      "https://www.ft.com/rss/home"),
+    ("El País",              "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/portada"),
+    ("El País Economía",     "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/economia/portada"),
+    ("Clarín",               "https://www.clarin.com/rss/lo-ultimo/"),
+    ("Le Monde",             "https://www.lemonde.fr/rss/une.xml"),
 ]
 
-# --- Coleta de notícias via Firecrawl ---
+
+# --- Coleta de notícias via RSS ---
 def coletar_noticias():
-    app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
     conteudo_bruto = []
 
-    for url in FONTES:
+    for nome, url in FONTES:
         try:
-            result = app.scrape_url(url, params={"formats": ["markdown"]})
-            texto = result.get("markdown", "")
-            if texto:
-                conteudo_bruto.append(f"=== FONTE: {url} ===\n{texto[:3000]}")
+            feed = feedparser.parse(url)
+            entradas = feed.entries[:8]  # pega as 8 mais recentes de cada fonte
+            if not entradas:
+                print(f"Vazio: {nome}")
+                continue
+
+            linhas = [f"=== {nome.upper()} ==="]
+            for entry in entradas:
+                titulo = entry.get("title", "").strip()
+                resumo = entry.get("summary", entry.get("description", "")).strip()
+                resumo = re.sub(r"<[^>]+>", "", resumo)[:300]
+                linhas.append(f"- {titulo}: {resumo}")
+
+            conteudo_bruto.append("\n".join(linhas))
+            print(f"OK: {nome} ({len(entradas)} artigos)")
         except Exception as e:
-            print(f"Erro ao raspar {url}: {e}")
+            print(f"Erro em {nome}: {e}")
 
     return "\n\n".join(conteudo_bruto)
 
@@ -45,24 +61,25 @@ def gerar_digest(conteudo_bruto):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     hoje = date.today().strftime("%d/%m/%Y")
 
-    prompt = f"""Você é um curador de notícias. Abaixo estão conteúdos coletados de feeds de notícias hoje ({hoje}).
+    prompt = f"""Você é um curador de notícias internacionais. Abaixo estão manchetes e resumos coletados hoje ({hoje}) dos jornais: New York Times, Wall Street Journal, Financial Times, El País, Clarín e Le Monde.
 
 Sua tarefa:
 1. Selecione entre 5 e 8 notícias relevantes sobre estes temas: {", ".join(TEMAS)}.
 2. Para cada notícia, escreva um parágrafo curto (3 a 5 linhas) explicando o que aconteceu e por que importa.
 3. Ordene por relevância e impacto.
 4. Escreva em português brasileiro, tom profissional mas acessível.
-5. Retorne APENAS o HTML do corpo do email, sem ```html``` ou explicações extras.
+5. Indique de qual jornal veio cada notícia.
+6. Retorne APENAS o HTML do corpo do email, sem ```html``` ou explicações extras.
 
 Formato de cada notícia no HTML:
 <div class="noticia">
   <h3>Título da notícia</h3>
-  <p class="tema">🏷 Tema</p>
+  <p class="tema">🏷 Tema · 📰 Nome do jornal</p>
   <p>Parágrafo explicativo aqui.</p>
 </div>
 
 Conteúdo coletado:
-{conteudo_bruto[:12000]}
+{conteudo_bruto[:14000]}
 """
 
     message = client.messages.create(
@@ -106,7 +123,7 @@ def montar_email(digest_html):
     {digest_html}
   </div>
   <div class="footer">
-    Gerado automaticamente com Firecrawl + Claude · Enviado às 7h
+    Fontes: NYT · WSJ · FT · El País · Clarín · Le Monde · Gerado com Claude · Enviado às 7h
   </div>
 </div>
 </body>
@@ -131,9 +148,14 @@ def enviar_email(html):
 
 # --- Main ---
 if __name__ == "__main__":
-    print("Coletando notícias...")
+    print("Coletando notícias via RSS...")
     conteudo = coletar_noticias()
 
+    if not conteudo:
+        print("Nenhum conteúdo coletado. Abortando.")
+        exit(1)
+
+    print(f"Conteúdo coletado: {len(conteudo)} chars")
     print("Gerando digest com Claude...")
     digest = gerar_digest(conteudo)
 
